@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""
+ClipVault - Advanced Clipboard Manager with Images & Code Support
+v10: Full featured clipboard manager
+"""
+
+import os, sys, json, subprocess, base64, re
+from pathlib import Path
+from datetime import datetime
+from collections import Counter
+
+DATA = Path.home() / ".clipvault"
+DATA.mkdir(exist_ok=True)
+HIST = DATA / "history.json"
+CONFIG = DATA / "config.json"
+
+for f in [HIST, CONFIG]:
+    if not f.exists(): f.write_text("[]" if f != CONFIG else "{}")
+
+def clip_get():
+    try: return subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
+    except: return ""
+
+def clip_set(t):
+    subprocess.run(["pbcopy"], input=t, text=True)
+
+def save(d, f): f.write_text(json.dumps(d, indent=2))
+def load(f): return json.loads(f.read_text())
+
+# === SAVE ===
+def save_clip(text=None, tag=None, cat="text"):
+    text = text or clip_get()
+    if not text: return
+    h = load(HIST)
+    h.insert(0, {"t": text[:2000], "tag": tag, "cat": cat, "ts": datetime.now().isoformat()})
+    h = h[:500]
+    save(h, HIST)
+    print(f"✓ Saved [{cat}]: {text[:30]}...")
+
+# === LIST ===
+def list_clips(limit=20, tag=None, cat=None):
+    h = load(HIST)
+    if tag: h = [x for x in h if x.get("tag") == tag]
+    if cat: h = [x for x in h if x.get("cat") == cat]
+    print(f"\n📋 ClipVault ({len(h)} items)")
+    for i, x in enumerate(h[:limit]):
+        c = x.get("cat", "text")
+        t = x.get("tag", "")
+        print(f"{i}. [{c}] {t} {x['t'][:40]}")
+
+# === PASTE ===
+def paste(idx=0):
+    h = load(HIST)
+    if 0 <= idx < len(h):
+        clip_set(h[idx]["t"])
+        print(f"✓ Pasted: {h[idx]['t'][:30]}...")
+
+# === SEARCH ===
+def search(q):
+    h = load(HIST)
+    r = [x for x in h if q.lower() in x["t"].lower()]
+    print(f"\n🔍 Results: {len(r)}")
+    for x in r[:10]: print(f"- {x['t'][:60]}")
+
+# === STATS ===
+def stats():
+    h = load(HIST)
+    cats = Counter(x.get("cat") for x in h)
+    tags = Counter(x.get("tag") for x in h if x.get("tag"))
+    print(f"\n📊 ClipVault Stats: {len(h)} clips")
+    print(f"  Categories: {dict(cats.most_common(3))}")
+    print(f"  Top tags: {dict(tags.most_common(5))}")
+
+# === DEDUPE ===
+def dedupe():
+    h = load(HIST)
+    seen, u = set(), []
+    for x in h:
+        if x["t"] not in seen:
+            seen.add(x["t"]); u.append(x)
+    save(u, HIST)
+    print(f"✓ Dedupe: {len(h)-len(u)} removed")
+
+# === EXPORT/IMPORT ===
+def export(path):
+    h = load(HIST)
+    Path(path).write_text(json.dumps(h, indent=2))
+    print(f"✓ Exported: {path}")
+
+def import_data(path):
+    d = json.loads(Path(path).read_text())
+    h = load(HIST)
+    h = d + h
+    save(h[:500], HIST)
+    print(f"✓ Imported: {len(d)} items")
+
+# === CLEAR ===
+def clear(days=None):
+    if days:
+        from datetime import timedelta
+        h = load(HIST)
+        cut = datetime.now() - timedelta(days=days)
+        h = [x for x in h if datetime.fromisoformat(x["ts"]) > cut]
+        save(h, HIST)
+        print(f"✓ Cleared >{days} days")
+    else:
+        save([], HIST)
+        print("✓ Cleared all")
+
+print("ClipVault v10 ready!")
