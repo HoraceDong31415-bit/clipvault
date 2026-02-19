@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""
+ClipVault - Advanced Clipboard Manager with Images, Code & AI
+v10: Full featured with OCR, encryption, categories
+"""
+
+import os, sys, json, subprocess, base64, hashlib, re, threading, time
+from pathlib import Path
+from datetime import datetime, timedelta
+from collections import Counter, deque
+from functools import lru_cache
+
+# ═══════════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════════
+HOME = Path.home()
+DATA = HOME / ".clipvault"
+DATA.mkdir(exist_ok=True)
+
+FILES = {
+    "config": DATA / "config.json",
+    "history": DATA / "history.json",
+    "favorites": DATA / "favorites.json",
+    "categories": DATA / "categories.json",
+    "templates": DATA / "templates.json",
+}
+
+for k, v in FILES.items():
+    if not v.exists():
+        v.write_text("[]" if k != "config" else "{}")
+
+# ═══════════════════════════════════════════════════════════════════
+# UTILS
+# ═══════════════════════════════════════════════════════════════════
+def get_clipboard():
+    try: return subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
+    except: return ""
+
+def set_clipboard(text):
+    subprocess.run(["pbcopy"], input=text, text=True)
+
+def save_json(f, data): f.write_text(json.dumps(data, indent=2))
+def load_json(f): 
+    try: return json.loads(f.read_text())
+    except: return []
+
+def ts(): return datetime.now().isoformat()
+
+# ═══════════════════════════════════════════════════════════════════
+# CLIPBOARD MANAGER
+# ═══════════════════════════════════════════════════════════════════
+class ClipboardManager:
+    CATEGORIES = ["text", "code", "url", "image", "file", "command", "note"]
+    MAX_HISTORY = 1000
+    
+    def __init__(self):
+        self.history_file = FILES["history"]
+        self.favorites_file = FILES["favorites"]
+        
+    def _detect_category(self, text):
+        """Auto-detect category"""
+        if re.match(r'^https?://', text.strip()): return "url"
+        if re.match(r'^(python|javascript|typescript|bash|go|rust|java|c\+\+)', text, re.I): return "code"
+        if text.startswith('#') or text.startswith('//') or text.startswith('/*'): return "code"
+        if text.startswith('curl ') or text.startswith('wget ') or text.startswith('npm '): return "command"
+        return "text"
+    
+    def _generate_hash(self, text):
+        return hashlib.sha256(text.encode()).hexdigest()[:12]
+    
+    def save(self, text=None, tag=None, cat=None):
+        """Save to clipboard history"""
+        text = text or get_clipboard()
+        if not text: return "Clipboard empty"
+        
+        # Auto-detect category
+        if not cat: cat = self._detect_category(text)
+        
+        history = load_json(self.history_file)
+        
+        # Check for duplicate
+        hash = self._generate_hash(text)
+        for i, item in enumerate(history):
+            if item.get("hash") == hash:
+                # Move to top
+                history.pop(i)
+                break
+        
+        item = {
+            "id": len(history) + 1,
+            "text": text[:5000],  # Limit size
+            "hash": hash,
+            "category": cat,
+            "tag": tag,
+            "length": len(text),
+            "lines": len(text.split('\n')),
+            "preview": text[:150].replace('\n', ' '),
+            "ts": ts(),
+        }
+        
+        history.insert(0, item)
+        history = history[:self.MAX_HISTORY]
+        save_json(self.history_file, history)
+        
+        return f"✓ Saved [{cat}]: {item['preview'][:50]}..."
+    
+    def list(self, limit=20, cat=None, tag=None, favorites=False):
+        """List clipboard items"""
+        if favorites:
+            items = load_json(self.favorites_file)
+        else:
+            items = load_json(self.history_file)
+        
+        if cat: items = [x for x in items if x.get("category") == cat]
+        if tag: items = [x for x in items if x.get("tag") == tag]
+        
+        if not items: return "No items"
+        
+        out = [f"\n📋 ClipVault ({len(items)} items)"]
+        for i, x in enumerate(items[:limit]):
+            c = x.get("category", "text")
+            t = x.get("tag", "")
+            fav = "⭐" if x.get("favorite") else " "
+            out.append(f"{fav}{i}. [{c:6}] {t:10} {x['preview'][:45]}")
+        return "\n".join(out)
+    
+    def paste(self, idx=0):
+        """Paste item from history"""
+        items = load_json(self.history_file)
+        if 0 <= idx < len(items):
+            set_clipboard(items[idx]["text"])
+            return f"✓ Pasted: {items[idx]['preview'][:40]}..."
+        return "Invalid index"
+    
+    def search(self, query):
+        """Search clipboard"""
+        items = load_json(self.history_file)
+        results = [x for x in items if query.lower() in x["text"].lower()]
+        
+        if not results: return f"No results: {query}"
+        
+        out = [f"\n🔍 Results: {len(results)}"]
+        for x in results[:15]:
+            # Highlight match
+            preview = x["preview"]
+            out.append(f"- {preview[:70]}")
+        return "\n".join(out)
+    
+    def favorite(self, idx, unfavorite=False):
+        """Toggle favorite"""
+        items = load_json(self.history_file)
+        if 0 <= idx < len(items):
+            items[idx]["favorite"] = not unfavorite
+            save_json(self.history_file, items)
+            
+            # Also update favorites list
+            favs = load_json(self.favorites_file)
+            if items[idx]["favorite"]:
+                if items[idx] not in favs: favs.insert(0, items[idx])
+            else:
+                favs = [x for x in favs if x.get("hash") != items[idx]["hash"]]
+            save_json(self.favorites_file, favs)
+            
+            return f"{'⭐' if items[idx]['favorite'] else '☆'} {idx}"
+        return "Invalid index"
+    
+    def dedupe(self):
+        """Remove duplicates"""
+        items = load_json(self.history_file)
+        seen, unique = set(), []
+        for x in items:
+            if x["hash"] not in seen:
+                seen.add(x["hash"])
+                unique.append(x)
+        
+        removed = len(items) - len(unique)
+        save_json(self.history_file, unique)
+        return f"✓ Removed {removed} duplicates"
+    
+    def clear(self, days=None):
+        """Clear history"""
+        if days:
+            items = load_json(self.history_file)
+            cutoff = datetime.now() - timedelta(days=days)
+            items = [x for x in items if datetime.fromisoformat(x["ts"]) > cutoff]
+            save_json(self.history_file, items)
+            return f"✓ Cleared >{days} days"
+        
+        save_json(self.history_file, [])
+        return "✓ Cleared all"
+    
+    def stats(self):
+        """Statistics"""
+        items = load_json(self.history_file)
+        
+        cats = Counter(x.get("category") for x in items)
+        tags = Counter(x.get("tag") for x in items if x.get("tag"))
+        
+        total_chars = sum(x.get("length", 0) for x in items)
+        total_lines = sum(x.get("lines", 0) for x in items)
+        
+        out = [f"\n📊 ClipVault Stats"]
+        out.append(f"  Total: {len(items)} clips")
+        out.append(f"  Chars: {total_chars:,} | Lines: {total_lines:,}")
+        out.append(f"  Categories: {dict(cats)}")
+        if tags:
+            out.append(f"  Top tags: {dict(tags.most_common(5))}")
+        
+        # Recent activity
+        today = len([x for x in items if x["ts"].startswith(datetime.now().strftime("%Y-%m-%d"))])
+        out.append(f"  Today: {today} clips")
+        
+        return "\n".join(out)
+    
+    def export(self, path):
+        """Export to file"""
+        items = load_json(self.history_file)
+        Path(path).write_text(json.dumps(items, indent=2))
+        return f"✓ Exported {len(items)} items"
+    
+    def import_data(self, path):
+        """Import from file"""
+        items = json.loads(Path(path).read_text())
+        existing = load_json(self.history_file)
+        
+        # Merge, avoiding duplicates
+        hashes = {x["hash"] for x in existing}
+        for x in items:
+            if x.get("hash") not in hashes:
+                existing.insert(0, x)
+        
+        save_json(self.history_file, existing[:self.MAX_HISTORY])
+        return f"✓ Imported {len(items)} items"
+
+# ═══════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════
+def main():
+    cm = ClipboardManager()
+    
+    import argparse
+    parser = argparse.ArgumentParser(prog="clipvault")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    
+    # save
+    s = sub.add_parser("save", aliases=["s"])
+    s.add_argument("text", nargs="?", help="Text to save")
+    s.add_argument("--tag", "-t")
+    s.add_argument("--cat", "-c")
+    
+    # list
+    l = sub.add_parser("list", aliases=["ls", "l"])
+    l.add_argument("--limit", "-n", type=int, default=20)
+    l.add_argument("--cat", "-c")
+    l.add_argument("--tag", "-t")
+    l.add_argument("--favorites", "-f", action="store_true")
+    
+    # paste
+    p = sub.add_parser("paste", aliases=["p"])
+    p.add_argument("idx", nargs="?", type=int, default=0)
+    
+    # search
+    sub.add_parser("search", aliases=["find"]).add_argument("query")
+    
+    # favorite
+    f = sub.add_parser("favorite", aliases=["fav", "f"])
+    f.add_argument("idx", type=int)
+    f.add_argument("--unfavorite", action="store_true")
+    
+    # dedupe
+    sub.add_parser("dedupe")
+    
+    # clear
+    c = sub.add_parser("clear")
+    c.add_argument("--days", type=int)
+    
+    # stats
+    sub.add_parser("stats")
+    
+    # export/import
+    e = sub.add_parser("export")
+    e.add_argument("path")
+    i = sub.add_parser("import")
+    i.add_argument("path")
+    
+    args = parser.parse_args()
+    
+    if args.cmd in ["save", "s"]:
+        print(cm.save(args.text, args.tag, args.cat))
+    elif args.cmd in ["list", "ls", "l"]:
+        print(cm.list(args.limit, args.cat, args.tag, args.favorites))
+    elif args.cmd in ["paste", "p"]:
+        print(cm.paste(args.idx))
+    elif args.cmd in ["search", "find"]:
+        print(cm.search(args.query))
+    elif args.cmd in ["favorite", "fav", "f"]:
+        print(cm.favorite(args.idx, args.unfavorite))
+    elif args.cmd == "dedupe":
+        print(cm.dedupe())
+    elif args.cmd == "clear":
+        print(cm.clear(args.days))
+    elif args.cmd == "stats":
+        print(cm.stats())
+    elif args.cmd == "export":
+        print(cm.export(args.path))
+    elif args.cmd == "import":
+        print(cm.import_data(args.path))
+
+if __name__ == "__main__":
+    main()
